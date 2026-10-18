@@ -59,6 +59,8 @@ MODEL_TYPES_REQUIRING_POSITION_IDS = {
     "qwen2",
     "qwen3",
     "qwen3_moe",
+    "qwen3_5",
+    "qwen3_5_text",
     "smollm3",
     "stablelm",
     "olmo2",

@@ -123,6 +123,8 @@ MODEL_NAMES = {
     "qwen2": "fxmarty/tiny-dummy-qwen2",
     "qwen3": "optimum-internal-testing/tiny-random-qwen3",
     "qwen3_moe": "optimum-internal-testing/tiny-random-qwen3_moe",
+    "qwen3_5": "optimum-internal-testing/tiny-random-qwen3_5",
+    "qwen3_5_text": "optimum-internal-testing/tiny-random-qwen3_5",
     "rembert": "hf-internal-testing/tiny-random-RemBertModel",
     "resnet": "hf-internal-testing/tiny-random-resnet",
     "roberta": "hf-internal-testing/tiny-random-RobertaModel",

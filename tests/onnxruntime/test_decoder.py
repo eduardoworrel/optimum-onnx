@@ -49,6 +49,8 @@ from optimum.exporters.onnx.model_configs import (
     PhiOnnxConfig,
     Qwen2OnnxConfig,
     Qwen3MoeOnnxConfig,
+    Qwen3_5OnnxConfig,
+    Qwen3_5TextModelOnnxConfig,
     Qwen3OnnxConfig,
     SmolLM3OnnxConfig,
     StableLMOnnxConfig,
@@ -114,6 +116,10 @@ class ORTModelForCausalLMIntegrationTest(ORTModelTestMixin):
         SUPPORTED_ARCHITECTURES.append("olmo2")
     if is_transformers_version(">=", str(Qwen2OnnxConfig.MIN_TRANSFORMERS_VERSION)):
         SUPPORTED_ARCHITECTURES.append("qwen2")
+    if is_transformers_version(">=", str(Qwen3_5OnnxConfig.MIN_TRANSFORMERS_VERSION)):
+        SUPPORTED_ARCHITECTURES.append("qwen3_5")
+    if is_transformers_version(">=", str(Qwen3_5TextModelOnnxConfig.MIN_TRANSFORMERS_VERSION)):
+        SUPPORTED_ARCHITECTURES.append("qwen3_5_text")
     if is_transformers_version(">=", str(GemmaOnnxConfig.MIN_TRANSFORMERS_VERSION)):
         SUPPORTED_ARCHITECTURES.append("gemma")
     if is_transformers_version(">=", str(Gemma2OnnxConfig.MIN_TRANSFORMERS_VERSION)):

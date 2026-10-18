@@ -215,6 +215,8 @@ class ORTModelForCausalLM(ORTModel, GenerationMixin):
             "qwen2",
             "qwen3",
             "qwen3_moe",
+            "qwen3_5",
+            "qwen3_5_text",
             "smollm3",
             "stablelm",
         }:

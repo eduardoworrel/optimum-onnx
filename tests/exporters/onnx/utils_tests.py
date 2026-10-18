@@ -175,6 +175,8 @@ PYTORCH_EXPORT_MODELS_TINY = {
     "pvt": "hf-internal-testing/tiny-random-PvtForImageClassification",
     "qwen2": "fxmarty/tiny-dummy-qwen2",
     "qwen3": "optimum-internal-testing/tiny-random-qwen3",
+    "qwen3_5": "optimum-internal-testing/tiny-random-qwen3_5",
+    "qwen3_5_text": "optimum-internal-testing/tiny-random-qwen3_5",
     "qwen3_moe": "optimum-internal-testing/tiny-random-qwen3_moe",
     "regnet": "hf-internal-testing/tiny-random-RegNetModel",
     "resnet": "hf-internal-testing/tiny-random-resnet",
