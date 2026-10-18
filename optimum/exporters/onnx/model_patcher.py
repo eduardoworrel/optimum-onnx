@@ -1544,11 +1544,200 @@ class Qwen3_5ModelPatcher(ModelPatcher):
         self._qwen3_5_mod = qwen3_5_mod
         self._orig_chunk_kernel = qwen3_5_mod.torch_chunk_gated_delta_rule
         recurrent_kernel = qwen3_5_mod.torch_recurrent_gated_delta_rule
+        orig_chunk = self._orig_chunk_kernel
 
-        def chunk_as_recurrent(query, key, value, g, beta, chunk_size=None, **kwargs):
-            return recurrent_kernel(query, key, value, g, beta, **kwargs)
+        import os as _os
 
-        qwen3_5_mod.torch_chunk_gated_delta_rule = chunk_as_recurrent
+        if _os.environ.get("QWEN35_DYNAMO") == "1":
+            # Single-graph (prefill + decode) export via torch.export: remove the data-dependent
+            # `seq_len == 1` fast paths in the Gated-DeltaNet forward so there is no branch to
+            # specialize — always use the chunked kernel + update_conv_state, which are correct
+            # for any sequence length and consume the passed conv/recurrent state.
+            import torch.nn.functional as _F
+
+            self._orig_gdn_forward = qwen3_5_mod.Qwen3_5GatedDeltaNet.forward
+            # The recurrent attention mask does varlen unpadding (.item()+arange+boolean index),
+            # which produces data-dependent/unbacked shapes torch.export can't trace. With a full
+            # (all-ones) attention mask it is a no-op, so disable it during export.
+            self._orig_rec_mask = qwen3_5_mod.create_recurrent_attention_mask
+            qwen3_5_mod.create_recurrent_attention_mask = lambda *a, **k: None
+            # create_causal_mask does varlen packing (.item()+arange+boolean index) that yields
+            # data-dependent/unbacked shapes. Replace it with a plain causal bool mask built from
+            # backed shape symbols (batch=1, no padding), correct for prefill and decode.
+            self._orig_causal_mask = qwen3_5_mod.create_causal_mask
+
+            def simple_causal_mask(config=None, inputs_embeds=None, attention_mask=None,
+                                   past_key_values=None, position_ids=None, **kw):
+                q = inputs_embeds.shape[1]
+                device = inputs_embeds.device
+                past = 0
+                if past_key_values is not None:
+                    for i, lt in enumerate(config.layer_types):
+                        if lt == "full_attention":
+                            k = past_key_values.layers[i].keys
+                            if k is not None:
+                                past = k.shape[2]
+                            break
+                kv = past + q
+                qi = torch.arange(q, device=device) + past
+                ki = torch.arange(kv, device=device)
+                return (ki[None, :] <= qi[:, None])[None, None]  # [1,1,q,kv] bool, True=attend
+
+            qwen3_5_mod.create_causal_mask = simple_causal_mask
+            # The text rotary embedding does MROPE recomposition (expand to 3 position axes +
+            # boolean-index section packing) that is unbacked under torch.export. For text-only
+            # all three axes equal the text positions, so a standard RoPE is exact and export-safe.
+            self._orig_rope_forward = qwen3_5_mod.Qwen3_5TextRotaryEmbedding.forward
+
+            def rope_forward(self, x, position_ids):
+                if position_ids.ndim == 3:
+                    position_ids = position_ids[0]
+                inv = self.inv_freq.to(device=x.device).float()
+                freqs = position_ids[:, :, None].float() * inv[None, None, :]
+                emb = torch.cat((freqs, freqs), dim=-1)
+                cos = (emb.cos() * self.attention_scaling).to(dtype=x.dtype)
+                sin = (emb.sin() * self.attention_scaling).to(dtype=x.dtype)
+                return cos, sin
+
+            qwen3_5_mod.Qwen3_5TextRotaryEmbedding.forward = rope_forward
+
+            import torch.nn.functional as _F
+
+            _CHUNK_L = int(_os.environ.get("QWEN35_CHUNK_L", "64"))
+
+            def single_chunk(query, key, value, g, beta, chunk_size=None, initial_state=None,
+                             output_final_state=False, use_qk_l2norm_in_kernel=False, **kw):
+                # Export-safe single-chunk Gated-DeltaNet: pad the sequence to exactly L so the
+                # chunk count is a static 1 (no data-dependent range loop) and the UT solve is the
+                # forward-substitution over the constant L. Correct for any seq_len <= L; the output
+                # is sliced back to seq_len (dynamic). This removes every data-dependent branch.
+                L = _CHUNK_L
+                initial_dtype = query.dtype
+                batch_size, sequence_length, _, k_head_dim = key.shape
+                num_v_heads, v_head_dim = value.shape[-2:]
+                recurrent_state_shape = (batch_size, num_v_heads, k_head_dim, v_head_dim)
+                torch._check(sequence_length > 0)
+                torch._check(sequence_length <= L)
+                decay = g
+                query, key, value, beta, decay = [
+                    x.transpose(1, 2).to(torch.float32, memory_format=torch.contiguous_format)
+                    for x in (query, key, value, beta, decay)
+                ]
+                if use_qk_l2norm_in_kernel:
+                    query = qwen3_5_mod.l2norm(query, dim=-1, eps=1e-6)
+                    key = qwen3_5_mod.l2norm(key, dim=-1, eps=1e-6)
+                query = query * (query.shape[-1] ** -0.5)
+                torch._check(sequence_length <= L)
+                pad_size = L - sequence_length
+                query, key, value = (_F.pad(x, (0, 0, 0, pad_size)) for x in (query, key, value))
+                beta, decay = (_F.pad(x, (0, pad_size)) for x in (beta, decay))
+                v_beta = value * beta.unsqueeze(-1)
+                k_beta = key * beta.unsqueeze(-1)
+                query, key, k_beta, v_beta = [
+                    x.reshape(x.shape[0], x.shape[1], 1, L, x.shape[-1]) for x in (query, key, k_beta, v_beta)
+                ]
+                decay = decay.reshape(decay.shape[0], decay.shape[1], 1, L)
+                strictly_upper = torch.ones(L, L, dtype=torch.bool, device=query.device).triu(1)
+                cum_decay = decay.cumsum(dim=3)
+                pairwise = cum_decay.unsqueeze(4) - cum_decay.unsqueeze(3)
+                pairwise = pairwise.masked_fill(strictly_upper, float("-inf")).exp()
+                ut_system = (k_beta @ key.transpose(-1, -2)) * pairwise
+                intra = (query @ key.transpose(-1, -2)) * pairwise
+                decayed_k_beta = k_beta * cum_decay.exp().unsqueeze(-1)
+                ut_system = -ut_system.tril(-1)
+                for i in range(1, L):
+                    row = ut_system[..., i, :i].clone()
+                    sub = ut_system[..., :i, :i].clone()
+                    ut_system[..., i, :i] = row + (row.unsqueeze(-1) * sub).sum(-2)
+                ut_system = ut_system + torch.eye(L, dtype=ut_system.dtype, device=ut_system.device)
+                new_values = ut_system @ v_beta
+                k_cumdecay = ut_system @ decayed_k_beta
+                last = (
+                    torch.zeros(recurrent_state_shape, dtype=new_values.dtype, device=new_values.device)
+                    if initial_state is None else initial_state.to(new_values)
+                )
+                core = torch.zeros_like(new_values)
+                query = query * cum_decay.exp().unsqueeze(-1)
+                key = key * (cum_decay[..., -1:] - cum_decay).exp().unsqueeze(-1)
+                chunk_decay = cum_decay[..., -1].exp()[..., None, None]
+                v_new = new_values[:, :, 0] - k_cumdecay[:, :, 0] @ last
+                inter = query[:, :, 0] @ last
+                core[:, :, 0] = inter + intra[:, :, 0] @ v_new
+                last = last * chunk_decay[:, :, 0] + key[:, :, 0].transpose(-1, -2) @ v_new
+                last_recurrent_state = None if not output_final_state else last
+                core = core.reshape(batch_size, num_v_heads, -1, v_head_dim)[:, :, :sequence_length]
+                core = core.transpose(1, 2).to(initial_dtype, memory_format=torch.contiguous_format)
+                return core, last_recurrent_state
+
+            qwen3_5_mod.torch_chunk_gated_delta_rule = single_chunk
+
+            def gdn_forward(self, hidden_states, cache_params=None, attention_mask=None, **kwargs):
+                m = qwen3_5_mod
+                hidden_states = m.apply_mask_to_padding_states(hidden_states, attention_mask)
+                batch_size, seq_len, _ = hidden_states.shape
+                mixed_qkv = self.in_proj_qkv(hidden_states).transpose(1, 2)
+                z = self.in_proj_z(hidden_states).reshape(batch_size, seq_len, -1, self.head_v_dim)
+                b = self.in_proj_b(hidden_states)
+                a = self.in_proj_a(hidden_states)
+                # Export-clean causal short conv with cache: cat(stored, new), run a *valid*
+                # conv (no padding) over the last (kernel-1 + seq) positions -> output is exactly
+                # seq (no trailing slice), and the present conv state is the last `kernel` columns.
+                # Avoids causal_conv1d_fn + dynamic negative slice, which breaks ORT buffer reuse.
+                K = self.conv_kernel_size
+                if cache_params is not None:
+                    stored = cache_params.layers[self.layer_idx].conv_states[0]
+                    full = torch.cat([stored, mixed_qkv], dim=-1)
+                    cache_params.layers[self.layer_idx].conv_states[0] = full[:, :, -K:]
+                    conv_in = full[:, :, full.shape[-1] - (K - 1 + seq_len):]
+                else:
+                    conv_in = torch.nn.functional.pad(mixed_qkv, (K - 1, 0))
+                mixed_qkv = torch.nn.functional.conv1d(
+                    conv_in, self.conv1d.weight, self.conv1d.bias, groups=self.conv_dim
+                )
+                if self.activation == "silu":
+                    mixed_qkv = torch.nn.functional.silu(mixed_qkv)
+                else:
+                    mixed_qkv = getattr(torch.nn.functional, self.activation)(mixed_qkv)
+                mixed_qkv = mixed_qkv.transpose(1, 2)
+                query, key, value = torch.split(
+                    mixed_qkv, [self.key_dim, self.key_dim, self.value_dim], dim=-1
+                )
+                query = query.reshape(batch_size, seq_len, -1, self.head_k_dim)
+                key = key.reshape(batch_size, seq_len, -1, self.head_k_dim)
+                value = value.reshape(batch_size, seq_len, -1, self.head_v_dim)
+                beta = b.sigmoid()
+                g = -self.A_log.float().exp() * _F.softplus(a.float() + self.dt_bias)
+                if self.num_v_heads // self.num_k_heads > 1:
+                    rep = self.num_v_heads // self.num_k_heads
+                    # repeat_interleave decomposes to .item()+arange+index under torch.export
+                    # (unbacked). expand+reshape is the export-safe equivalent for a constant rep.
+                    def _rep(x):
+                        b, s, h, d = x.shape
+                        return x.unsqueeze(3).expand(b, s, h, rep, d).reshape(b, s, h * rep, d)
+                    query = _rep(query)
+                    key = _rep(key)
+                recurrent_state = (
+                    cache_params.layers[self.layer_idx].recurrent_states[0] if cache_params is not None else None
+                )
+                core_attn_out, last_recurrent_state = m.torch_chunk_gated_delta_rule(
+                    query, key, value, g=g, beta=beta, initial_state=recurrent_state,
+                    output_final_state=cache_params is not None, use_qk_l2norm_in_kernel=True,
+                    cu_seqlens=kwargs.pop("cu_seq_lens_q", None), **kwargs,
+                )
+                if cache_params is not None:
+                    cache_params.update_recurrent_state(last_recurrent_state, self.layer_idx)
+                core_attn_out = core_attn_out.reshape(-1, self.head_v_dim)
+                z = z.reshape(-1, self.head_v_dim)
+                core_attn_out = self.norm(core_attn_out, z)
+                core_attn_out = core_attn_out.reshape(batch_size, seq_len, -1)
+                return self.out_proj(core_attn_out)
+
+            qwen3_5_mod.Qwen3_5GatedDeltaNet.forward = gdn_forward
+        else:
+            def chunk_as_recurrent(query, key, value, g, beta, chunk_size=None, **kwargs):
+                return recurrent_kernel(query, key, value, g, beta, **kwargs)
+
+            qwen3_5_mod.torch_chunk_gated_delta_rule = chunk_as_recurrent
         return self
 
     def __exit__(self, exc_type, exc_value, traceback):
@@ -1558,3 +1747,11 @@ class Qwen3_5ModelPatcher(ModelPatcher):
         module.postprocess_past_key_values = self._orig_postprocess
         if getattr(self, "_qwen3_5_mod", None) is not None:
             self._qwen3_5_mod.torch_chunk_gated_delta_rule = self._orig_chunk_kernel
+            if getattr(self, "_orig_gdn_forward", None) is not None:
+                self._qwen3_5_mod.Qwen3_5GatedDeltaNet.forward = self._orig_gdn_forward
+            if getattr(self, "_orig_rec_mask", None) is not None:
+                self._qwen3_5_mod.create_recurrent_attention_mask = self._orig_rec_mask
+            if getattr(self, "_orig_causal_mask", None) is not None:
+                self._qwen3_5_mod.create_causal_mask = self._orig_causal_mask
+            if getattr(self, "_orig_rope_forward", None) is not None:
+                self._qwen3_5_mod.Qwen3_5TextRotaryEmbedding.forward = self._orig_rope_forward

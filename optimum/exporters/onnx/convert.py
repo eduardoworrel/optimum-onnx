@@ -641,7 +641,9 @@ def export_pytorch(
             if is_torch_version(">=", "2.9"):
                 export_kwargs = {"dynamo": dynamo, "external_data": dynamo}
                 if dynamo:
-                    if len(dynamic_axes) == len(dummy_inputs):
+                    if hasattr(config, "build_dynamo_dynamic_shapes"):
+                        export_kwargs["dynamic_shapes"] = config.build_dynamo_dynamic_shapes(dummy_inputs)
+                    elif len(dynamic_axes) == len(dummy_inputs):
                         export_kwargs["dynamic_shapes"] = dynamic_axes
                     else:
                         dummy_inputs, dynamic_shapes = convert_dynamic_axes_into_dynamic_shapes(
