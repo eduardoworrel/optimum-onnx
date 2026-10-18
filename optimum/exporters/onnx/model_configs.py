@@ -37,6 +37,7 @@ from optimum.exporters.onnx.input_generators import (
     DummyMoonshineAudioInputGenerator,
     DummySanaTransforemerTextInputGenerator,
     GPTBigCodeDummyPastKeyValuesGenerator,
+    Qwen3_5DummyPastKeyValuesGenerator,
 )
 from optimum.exporters.onnx.model_patcher import (
     BigBirdPegasusModelPatcher,
@@ -48,6 +49,7 @@ from optimum.exporters.onnx.model_patcher import (
     MgpstrModelPatcher,
     MoonshineModelPatcher,
     MusicgenModelPatcher,
+    Qwen3_5ModelPatcher,
     Qwen3MoeModelPatcher,
     SAMModelPatcher,
     SentenceTransformersCLIPPatcher,
@@ -503,6 +505,147 @@ class Qwen3MoeOnnxConfig(LlamaOnnxConfig):
     NORMALIZED_CONFIG_CLASS = NormalizedTextConfigWithGQA
     MIN_TRANSFORMERS_VERSION = version.parse("4.51.0")
     _MODEL_PATCHER = Qwen3MoeModelPatcher
+
+
+class Qwen3_5OnnxConfig(LlamaOnnxConfig):
+    """ONNX export config for Qwen3.5 (alias3-micro family) — a hybrid decoder that
+    interleaves Gated-DeltaNet ``linear_attention`` layers with standard
+    ``full_attention`` layers, selected per layer by ``config.layer_types``.
+
+    Unlike a pure transformer decoder, the cache is heterogeneous:
+
+    - ``full_attention`` layers → growing KV cache
+      ``past_key_values.{i}.key`` / ``past_key_values.{i}.value``  (dynamic seq axis)
+    - ``linear_attention`` layers → fixed-size recurrent state
+      ``past_conv.{i}`` and ``past_recurrent.{i}``  (no seq axis — never grows)
+
+    ``i`` is the global layer index so the ONNX I/O names line up 1:1 with both the
+    torch.onnx graph and the names transformers.js reads back. Outputs mirror the
+    inputs with the ``present`` / ``present_conv`` / ``present_recurrent`` prefixes.
+    """
+
+    NORMALIZED_CONFIG_CLASS = NormalizedTextConfigWithGQA
+    MIN_TRANSFORMERS_VERSION = version.parse("5.0.0")
+    DUMMY_INPUT_GENERATOR_CLASSES = (DummyTextInputGenerator, Qwen3_5DummyPastKeyValuesGenerator)
+    DUMMY_PKV_GENERATOR_CLASS = Qwen3_5DummyPastKeyValuesGenerator
+    _MODEL_PATCHER = Qwen3_5ModelPatcher
+
+    @property
+    def _layer_types(self) -> list[str]:
+        return list(self._config.layer_types)
+
+    def add_past_key_values(self, inputs_or_outputs: dict[str, dict[int, str]], direction: str):
+        if direction not in ["inputs", "outputs"]:
+            raise ValueError(f'direction must either be "inputs" or "outputs", but {direction} was given')
+
+        if direction == "inputs":
+            seq = "past_sequence_length"
+            kv, conv, rec = "past_key_values", "past_conv", "past_recurrent"
+        else:
+            seq = "past_sequence_length + sequence_length"
+            kv, conv, rec = "present", "present_conv", "present_recurrent"
+
+        # Two leaves per layer, in global layer order, matching transformers.js naming for
+        # qwen3_5_text: full_attention -> key/value (dynamic seq); linear_attention ->
+        # conv + recurrent (fixed size). ``ordered_inputs`` is overridden below so the
+        # conv/recurrent names survive the forward-signature matching.
+        for i, layer_type in enumerate(self._layer_types):
+            if layer_type == "full_attention":
+                inputs_or_outputs[f"{kv}.{i}.key"] = {0: "batch_size", 2: seq}
+                inputs_or_outputs[f"{kv}.{i}.value"] = {0: "batch_size", 2: seq}
+            else:  # linear_attention (Gated-DeltaNet)
+                inputs_or_outputs[f"{conv}.{i}"] = {0: "batch_size"}
+                inputs_or_outputs[f"{rec}.{i}"] = {0: "batch_size"}
+
+    def ordered_inputs(self, model):
+        # The base matches input names against the forward signature (``past_key_values``),
+        # which drops the ``past_conv``/``past_recurrent`` names (no matching parameter) and
+        # would leave those graph inputs unnamed. Re-insert every cache input in the exact
+        # per-layer order of ``self.inputs`` so the flattened dummy leaves line up.
+        base = super().ordered_inputs(model)
+        cache_prefixes = ("past_key_values", "past_conv", "past_recurrent", "present")
+        ordered = {k: v for k, v in base.items() if not k.startswith(cache_prefixes)}
+        for k, v in self.inputs.items():
+            if k.startswith(cache_prefixes):
+                ordered[k] = v
+        return ordered
+
+    def flatten_past_key_values(self, flattened_output, name, idx, t):
+        # name is "past_key_values" (inputs) or "present" (outputs).
+        if self._layer_types[idx] == "full_attention":
+            flattened_output[f"{name}.{idx}.key"] = t[0]
+            flattened_output[f"{name}.{idx}.value"] = t[1]
+        else:
+            prefix = "present" if name == "present" else "past"
+            flattened_output[f"{prefix}_conv.{idx}"] = t[0]
+            flattened_output[f"{prefix}_recurrent.{idx}"] = t[1]
+
+    def generate_dummy_inputs(self, framework: str = "pt", **kwargs):
+        # The base machinery assumes a single uniform KV bundle; here we build the
+        # non-cache inputs normally and then a *nested* past_key_values structure with
+        # one 2-tuple per layer: (key, value) for full-attention layers, (conv, recurrent)
+        # for linear-attention layers. torch.onnx flattens this depth-first, matching the
+        # flat names from add_past_key_values.
+        dummy_generators = self._create_dummy_input_generator_classes(**kwargs)
+        dummy_inputs = {}
+        non_past = [
+            name
+            for name in self.inputs
+            if not name.startswith(("past_key_values", "past_conv", "past_recurrent"))
+        ]
+        import numpy as np
+
+        seq_len = int(kwargs.get("sequence_length", 16))
+        batch = int(kwargs.get("batch_size", 2))
+        for name in non_past:
+            # attention_mask via generator uses randint(1, seq-1) which breaks at seq==1;
+            # build it as all-ones directly (correct for a fully-attended dummy).
+            if name == "attention_mask":
+                ones = np.ones((batch, seq_len), dtype=np.int64)
+                if framework == "pt":
+                    import torch
+
+                    dummy_inputs[name] = torch.from_numpy(ones)
+                else:
+                    dummy_inputs[name] = ones
+                continue
+            for gen in dummy_generators:
+                if gen.supports_input(name):
+                    dummy_inputs[name] = self.overwrite_shape_and_generate_input(
+                        gen, name, framework, input_shapes=kwargs
+                    )
+                    break
+            else:
+                raise RuntimeError(f'Could not generate dummy input for "{name}".')
+
+        if self.use_past_in_inputs and self.use_cache_branch is not False:
+            pkv = self.DUMMY_PKV_GENERATOR_CLASS(
+                task=self.task, normalized_config=self._normalized_config, **kwargs
+            )
+            kv = pkv.generate("past_key_values", framework=framework, float_dtype=self.float_dtype)
+            conv = pkv.generate("past_conv", framework=framework, float_dtype=self.float_dtype)
+            rec = pkv.generate("past_recurrent", framework=framework, float_dtype=self.float_dtype)
+            nested, ki, ci = [], 0, 0
+            for layer_type in self._layer_types:
+                if layer_type == "full_attention":
+                    nested.append((kv[ki][0], kv[ki][1]))
+                    ki += 1
+                else:
+                    nested.append((conv[ci], rec[ci]))
+                    ci += 1
+            dummy_inputs["past_key_values"] = nested
+
+        return dummy_inputs
+
+
+@register_tasks_manager_onnx("qwen3_5", *COMMON_TEXT_GENERATION_TASKS)
+class Qwen3_5TextOnnxConfig(Qwen3_5OnnxConfig):
+    pass
+
+
+@register_tasks_manager_onnx("qwen3_5_text", *COMMON_TEXT_GENERATION_TASKS)
+class Qwen3_5TextModelOnnxConfig(Qwen3_5OnnxConfig):
+    pass
 
 
 @register_tasks_manager_onnx("gemma", *[*COMMON_TEXT_GENERATION_TASKS, "text-classification"])

@@ -1459,3 +1459,102 @@ class GptOssModelPatcher(ModelPatcher):
 
         if is_transformers_version(">=", "4.55.0"):
             GptOssExperts.forward = self.original_gpt_oss_forward
+
+
+class Qwen3_5ModelPatcher(ModelPatcher):
+    """Model patcher for the Qwen3.5 hybrid decoder.
+
+    The ONNX graph exposes the cache as a flat, per-layer set of tensors, but the model's
+    ``forward`` expects a single hybrid ``DynamicCache`` whose layers are heterogeneous
+    (standard KV layers interleaved with Gated-DeltaNet conv/recurrent layers). This patcher
+    bridges the two:
+
+    - on the way in, it rebuilds a ``DynamicCache(config=...)`` and populates each layer from
+      the nested ``past_key_values`` structure produced by the ONNX config
+      (``(key, value)`` for full-attention layers, ``(conv, recurrent)`` for linear ones);
+    - on the way out, it flattens the returned cache back into the same per-layer nesting so
+      the ``present*`` outputs line up with the names declared by ``add_past_key_values``.
+    """
+
+    def __init__(self, config, model, model_kwargs=None):
+        super().__init__(config, model, model_kwargs)
+        model_config = model.config.get_text_config() if hasattr(model.config, "get_text_config") else model.config
+        self._layer_types = list(model_config.layer_types)
+        self._model_config = model_config
+
+    def __enter__(self):
+        super().__enter__()
+        # The base patched_forward resolves preprocess/postprocess_past_key_values as module
+        # globals at call time, so swapping them here makes it drive the hybrid cache without
+        # duplicating the (fragile) argument-binding and output-filtering logic.
+        from transformers.cache_utils import DynamicCache
+
+        layer_types = self._layer_types
+        model_config = self._model_config
+        module = sys.modules[__name__]
+        self._orig_preprocess = module.preprocess_past_key_values
+        self._orig_postprocess = module.postprocess_past_key_values
+
+        def hybrid_preprocess(past_key_values):
+            if not isinstance(past_key_values, (list, tuple)):
+                return past_key_values
+            cache = DynamicCache(config=model_config)
+            for i, (a, b) in enumerate(past_key_values):
+                layer = cache.layers[i]
+                if layer_types[i] == "full_attention":
+                    # Wire the given key/value tensors directly so they become graph inputs
+                    # (lazy_initialization would allocate fresh zeros, disconnecting them).
+                    layer.keys, layer.values = a, b
+                    layer.is_initialized = True
+                    if getattr(layer, "device", None) is None:
+                        layer.dtype, layer.device = a.dtype, a.device
+                else:  # linear_attention (Gated-DeltaNet): conv + recurrent state
+                    # Keep the provided tensors as the state (dicts keyed by state_idx 0) so
+                    # the in-place state updates trace into the present_* graph outputs.
+                    layer.conv_states = {0: a}
+                    layer.recurrent_states = {0: b}
+                    layer.conv_kernel_size = {0: a.shape[-1]}
+                    layer.is_conv_states_initialized = {0: True}
+                    layer.is_recurrent_states_initialized = {0: True}
+                    layer.has_previous_state = {0: True}
+                    if getattr(layer, "device", None) is None:
+                        layer.dtype, layer.device = a.dtype, a.device
+            return cache
+
+        def hybrid_postprocess(past_key_values, output_names):
+            if not isinstance(past_key_values, DynamicCache):
+                return past_key_values
+            nested = []
+            for i, layer in enumerate(past_key_values.layers):
+                if layer_types[i] == "full_attention":
+                    nested.append((layer.keys, layer.values))
+                else:
+                    nested.append((layer.conv_states[0], layer.recurrent_states[0]))
+            return tuple(nested)
+
+        module.preprocess_past_key_values = hybrid_preprocess
+        module.postprocess_past_key_values = hybrid_postprocess
+
+        # Force the export-safe recurrent Gated-DeltaNet kernel. The chunked prefill kernel
+        # (torch_chunk_gated_delta_rule) uses linalg_solve_triangular / in-place copy_ and a
+        # data-dependent sequence branch that neither ONNX exporter can serialize, while the
+        # recurrent kernel computes the same result position-by-position and traces cleanly.
+        import transformers.models.qwen3_5.modeling_qwen3_5 as qwen3_5_mod
+
+        self._qwen3_5_mod = qwen3_5_mod
+        self._orig_chunk_kernel = qwen3_5_mod.torch_chunk_gated_delta_rule
+        recurrent_kernel = qwen3_5_mod.torch_recurrent_gated_delta_rule
+
+        def chunk_as_recurrent(query, key, value, g, beta, chunk_size=None, **kwargs):
+            return recurrent_kernel(query, key, value, g, beta, **kwargs)
+
+        qwen3_5_mod.torch_chunk_gated_delta_rule = chunk_as_recurrent
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        super().__exit__(exc_type, exc_value, traceback)
+        module = sys.modules[__name__]
+        module.preprocess_past_key_values = self._orig_preprocess
+        module.postprocess_past_key_values = self._orig_postprocess
+        if getattr(self, "_qwen3_5_mod", None) is not None:
+            self._qwen3_5_mod.torch_chunk_gated_delta_rule = self._orig_chunk_kernel
