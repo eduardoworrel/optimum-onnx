@@ -570,6 +570,27 @@ class Qwen3_5OnnxConfig(LlamaOnnxConfig):
                 ordered[k] = v
         return ordered
 
+    def build_dynamo_dynamic_shapes(self, dummy_inputs):
+        from torch.export import Dim
+        batch = Dim("batch_size", min=1, max=4096)
+        seq = Dim("sequence_length", min=1, max=131072)
+        past = Dim("past_sequence_length", min=0, max=131072)
+        total = Dim("total_sequence_length", min=1, max=262144)
+        shapes = {}
+        for name in dummy_inputs:
+            if name == "attention_mask":
+                shapes[name] = {0: batch, 1: total}
+            elif name in ("input_ids", "position_ids"):
+                shapes[name] = {0: batch, 1: seq}
+            elif name == "past_key_values":
+                nested = []
+                for lt in self._layer_types:
+                    nested.append(({0: batch, 2: past}, {0: batch, 2: past}) if lt == "full_attention" else ({0: batch}, {0: batch}))
+                shapes[name] = nested
+            else:
+                shapes[name] = {}
+        return shapes
+
     def flatten_past_key_values(self, flattened_output, name, idx, t):
         # name is "past_key_values" (inputs) or "present" (outputs).
         if self._layer_types[idx] == "full_attention":
@@ -601,7 +622,9 @@ class Qwen3_5OnnxConfig(LlamaOnnxConfig):
             # attention_mask via generator uses randint(1, seq-1) which breaks at seq==1;
             # build it as all-ones directly (correct for a fully-attended dummy).
             if name == "attention_mask":
-                ones = np.ones((batch, seq_len), dtype=np.int64)
+                # length = past + seq so mask_len is a separate axis from seq_len (decode passes a full mask)
+                past_len = int(kwargs.get("sequence_length", 16))
+                ones = np.ones((batch, past_len + seq_len), dtype=np.int64)
                 if framework == "pt":
                     import torch
 
