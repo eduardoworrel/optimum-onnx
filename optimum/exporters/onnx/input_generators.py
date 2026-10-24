@@ -108,3 +108,50 @@ class DummySanaTransforemerTextInputGenerator(DummyTransformerTextInputGenerator
             return super().generate(
                 input_name=input_name, framework=framework, int_dtype=int_dtype, float_dtype=float_dtype
             )
+
+class Qwen3_5DummyPastKeyValuesGenerator(DummyPastKeyValuesGenerator):
+    """Cache hibrido do Qwen3.5 no formato de lista de tuplas (o que o optimum espera).
+
+    Cada entrada corresponde a uma camada, na ordem de `config.layer_types`:
+      - `full_attention`   -> (key, value)  com (batch, kv_heads, past, head_dim)
+      - `linear_attention` -> (conv, recurrent) com (batch, conv_dim, kernel) e
+                              (batch, num_v_heads, k_head_dim, v_head_dim)
+    O optimum converte essa lista em cache do transformers antes do forward.
+    """
+
+    def __init__(self, task: str, normalized_config, **kwargs):
+        super().__init__(task=task, normalized_config=normalized_config, **kwargs)
+        self._cfg_raw = getattr(normalized_config, "_config", None) or normalized_config
+
+    def generate(self, input_name: str, framework: str = "pt", int_dtype: str = "int64", float_dtype: str = "fp32"):
+        cfg = self._cfg_raw
+        layer_types = list(cfg.layer_types)
+        k_heads = cfg.linear_num_key_heads
+        v_heads = cfg.linear_num_value_heads
+        k_head_dim = cfg.linear_key_head_dim
+        v_head_dim = cfg.linear_value_head_dim
+        conv_kernel = cfg.linear_conv_kernel_dim
+        conv_dim = 2 * k_heads * k_head_dim + v_heads * v_head_dim
+        kv_heads = cfg.num_key_value_heads
+        head_dim = cfg.head_dim
+
+        pkv = []
+        for lt in layer_types:
+            if lt == "full_attention":
+                shape = (self.batch_size, kv_heads, self.sequence_length, head_dim)
+                pkv.append(
+                    (
+                        self.random_float_tensor(shape, framework=framework, dtype=float_dtype),
+                        self.random_float_tensor(shape, framework=framework, dtype=float_dtype),
+                    )
+                )
+            else:
+                conv_shape = (self.batch_size, conv_dim, conv_kernel)
+                rec_shape = (self.batch_size, v_heads, k_head_dim, v_head_dim)
+                pkv.append(
+                    (
+                        self.random_float_tensor(conv_shape, framework=framework, dtype=float_dtype),
+                        self.random_float_tensor(rec_shape, framework=framework, dtype=float_dtype),
+                    )
+                )
+        return pkv

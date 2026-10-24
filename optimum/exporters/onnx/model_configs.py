@@ -34,6 +34,7 @@ from optimum.exporters.onnx.config import (
     VisionOnnxConfig,
 )
 from optimum.exporters.onnx.input_generators import (
+    Qwen3_5DummyPastKeyValuesGenerator,
     DummyMoonshineAudioInputGenerator,
     DummySanaTransforemerTextInputGenerator,
     GPTBigCodeDummyPastKeyValuesGenerator,
@@ -49,6 +50,7 @@ from optimum.exporters.onnx.model_patcher import (
     MoonshineModelPatcher,
     MusicgenModelPatcher,
     Qwen3MoeModelPatcher,
+    Qwen3_5ModelPatcher,
     SAMModelPatcher,
     SentenceTransformersCLIPPatcher,
     SentenceTransformersTransformerPatcher,
@@ -2854,3 +2856,52 @@ class DcaeDecoderOnnxConfig(VaeDecoderOnnxConfig):
                 3: f"latent_width * {up_sampling_factor}",
             }
         }
+
+@register_tasks_manager_onnx("qwen3_5", *COMMON_TEXT_GENERATION_TASKS)
+@register_tasks_manager_onnx("qwen3_5_text", *COMMON_TEXT_GENERATION_TASKS)
+class Qwen3_5OnnxConfig(LlamaOnnxConfig):
+    """Qwen3.5 e hibrido: atencao linear (Gated-DeltaNet) intercalada com atencao completa 3:1.
+
+    O cache NAO e so KV. Cada camada `linear_attention` carrega dois estados proprios:
+      - `past_conv.{i}`      (batch, conv_dim, kernel_size)      estado do conv causal
+      - `past_recurrent.{i}` (batch, num_v_heads, k, v)          estado recorrente do delta rule
+    e cada camada `full_attention` carrega o par KV usual. Por isso este config sobrescreve a
+    nomeacao do cache (`add_past_key_values` + `flatten_past_key_values`): a herança de Llama
+    emitiria `.key`/`.value` para todas as camadas, e as lineares nao tem esses tensores.
+    """
+
+    DUMMY_INPUT_GENERATOR_CLASSES = (DummyTextInputGenerator, Qwen3_5DummyPastKeyValuesGenerator)
+    DUMMY_PKV_GENERATOR_CLASS = Qwen3_5DummyPastKeyValuesGenerator
+    NORMALIZED_CONFIG_CLASS = NormalizedTextConfigWithGQA
+    MIN_TRANSFORMERS_VERSION = version.parse("4.58.0")
+    _MODEL_PATCHER = Qwen3_5ModelPatcher
+
+    @property
+    def _layer_types(self):
+        # NormalizedConfig embrulha o config original; `layer_types` nao e um campo que ele
+        # normaliza, entao lemos do config cru.
+        cfg = getattr(self._normalized_config, "_config", None) or self._normalized_config
+        return list(cfg.layer_types)
+
+    def add_past_key_values(self, inputs_or_outputs, direction: str):
+        if direction not in ("inputs", "outputs"):
+            raise ValueError(f'direction must be "inputs" or "outputs", got {direction!r}')
+        name = "past_key_values" if direction == "inputs" else "present"
+        seq = "past_sequence_length" if direction == "inputs" else "past_sequence_length + sequence_length"
+        for i, lt in enumerate(self._layer_types):
+            if lt == "full_attention":
+                inputs_or_outputs[f"{name}.{i}.key"] = {0: "batch_size", 2: seq}
+                inputs_or_outputs[f"{name}.{i}.value"] = {0: "batch_size", 2: seq}
+            else:
+                # os eixos dos estados lineares sao estaticos: so batch e dinamico
+                inputs_or_outputs[f"{name}.{i}.conv"] = {0: "batch_size"}
+                inputs_or_outputs[f"{name}.{i}.recurrent"] = {0: "batch_size"}
+
+    def flatten_past_key_values(self, flattened_output, name: str, idx: int, t):
+        if self._layer_types[idx] == "full_attention":
+            flattened_output[f"{name}.{idx}.key"] = t[0]
+            flattened_output[f"{name}.{idx}.value"] = t[1]
+        else:
+            flattened_output[f"{name}.{idx}.conv"] = t[0]
+            flattened_output[f"{name}.{idx}.recurrent"] = t[1]
+

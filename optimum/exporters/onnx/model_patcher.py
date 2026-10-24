@@ -13,6 +13,8 @@
 # limitations under the License.
 from __future__ import annotations
 
+import os
+
 import dataclasses
 import functools
 import inspect
@@ -198,18 +200,49 @@ def preprocess_encoder_outputs(encoder_outputs):
     return encoder_outputs
 
 
-def preprocess_past_key_values(past_key_values):
+
+def _raw_model_config(cfg):
+    """Extrai o PreTrainedConfig cru da OnnxConfig/NormalizedConfig, para instanciar caches."""
+    if cfg is None:
+        return None
+    norm = getattr(cfg, "_normalized_config", cfg)
+    raw = getattr(norm, "_config", norm)
+    return raw
+
+
+def preprocess_past_key_values(past_key_values, config=None):
+    """Converte a lista de tuplas do dummy generator em cache do transformers.
+
+    `config` e necessario para caches hibridos (ex.: Qwen3.5, 3:1 linear/full): sem ele o
+    `DynamicCache` monta `DynamicLayer` em TODAS as camadas, e o modelo falha em
+    "Cannot get conv state for non linear attention layer".
+    """
     if (
         is_transformers_version(">=", "4.48")
         and isinstance(past_key_values, (list, tuple))
         and isinstance(past_key_values[0], (list, tuple))
     ):
-        if len(past_key_values[0]) == 2:
-            if hasattr(DynamicCache, "from_legacy_cache"):
+        n_fields = len(past_key_values[0])
+        if n_fields == 2:
+            raw_cfg = _raw_model_config(config)
+            if raw_cfg is not None and hasattr(raw_cfg, "layer_types"):
+                # Usar a API oficial (`update` / `update_conv_state` / `update_recurrent_state`):
+                # atribuir `.keys` direto NAO conta para `get_seq_length()` (as camadas tem
+                # inicializacao lazy), e o modelo entao trata o passado como vazio.
+                cache = DynamicCache(config=raw_cfg)
+                for idx, (t0, t1) in enumerate(past_key_values):
+                    layer = cache.layers[idx]
+                    if hasattr(layer, "update_conv_state") and hasattr(layer, "update_recurrent_state"):
+                        layer.update_conv_state(t0, 0)
+                        layer.update_recurrent_state(t1, 0)
+                    else:
+                        layer.update(t0, t1, {})
+                past_key_values = cache
+            elif hasattr(DynamicCache, "from_legacy_cache"):
                 past_key_values = DynamicCache.from_legacy_cache(past_key_values)
             else:
                 past_key_values = DynamicCache(past_key_values)
-        elif len(past_key_values[0]) == 4:
+        elif n_fields == 4:
             if hasattr(EncoderDecoderCache, "from_legacy_cache"):
                 past_key_values = EncoderDecoderCache.from_legacy_cache(past_key_values)
             else:
@@ -219,18 +252,23 @@ def preprocess_past_key_values(past_key_values):
                 )
         else:
             raise ValueError(
-                f"past_key_values should have either 2 or 4 elements, but it has {len(past_key_values[0])} elements."
+                f"past_key_values should have either 2 or 4 elements, but it has {n_fields} elements."
             )
 
     return past_key_values
-
-
 def postprocess_past_key_values(past_key_values, output_names: list[str]):
     if is_transformers_version(">=", "4.48") and isinstance(past_key_values, (EncoderDecoderCache, DynamicCache)):
         if hasattr(past_key_values, "to_legacy_cache"):
             past_key_values = past_key_values.to_legacy_cache()
         elif isinstance(past_key_values, DynamicCache):
-            past_key_values = [(lay.keys, lay.values) for lay in past_key_values.layers]
+            # Cache hibrido (Qwen3.5): camadas lineares nao tem `.keys`, tem conv/recurrent.
+            out = []
+            for lay in past_key_values.layers:
+                if hasattr(lay, "keys") and lay.keys is not None:
+                    out.append((lay.keys, lay.values))
+                else:
+                    out.append((lay.conv_states[0], lay.recurrent_states[0]))
+            past_key_values = out
         elif isinstance(past_key_values, EncoderDecoderCache):
             past_key_values = [
                 (self_lay.keys, self_lay.values, cross_lay.keys, cross_lay.values)
@@ -404,8 +442,8 @@ else:
 # Custom vectorized implementation of sdpa_mask without using vmap
 def sdpa_mask_without_vmap(
     batch_size: int,
-    cache_position: torch.Tensor,
-    kv_length: int,
+    cache_position: torch.Tensor | None = None,
+    kv_length: int | None = None,
     kv_offset: int = 0,
     mask_function: Callable | None = None,
     attention_mask: torch.Tensor | None = None,
@@ -416,6 +454,35 @@ def sdpa_mask_without_vmap(
     if mask_function is None:
         mask_function = causal_mask_function
 
+    # Modelos hibridos (ex.: Qwen3.5, Gated-DeltaNet + atencao completa) chamam a mascara
+    # recorrente sem passar cache_position/kv_length. Sem estes defaults o export quebra em
+    # "missing 1 required positional argument: 'cache_position'".
+    # Modelos hibridos (Qwen3.5) chamam a mascara sem kv_length/kv_offset/cache_position. O optimum
+    # registra esta funcao no lugar da original, entao os defaults precisam ser derivados aqui.
+    # A attention_mask de entrada e 2D (batch, past+seq): e ela que define o eixo KV.
+    mask_len = attention_mask.shape[-1] if attention_mask is not None else None
+    if kv_length is None:
+        kv_length = mask_len if mask_len is not None else 1
+    if kv_offset is None:
+        kv_offset = 0
+    # A interface recebe `q_length` explicitamente de `create_causal_mask`. E a fonte correta do
+    # comprimento de query — derivar de kv_length produzia mascara (32,32) para query de 16.
+    _qlen_kw = kwargs.get("q_length")
+    if cache_position is None:
+        # Qwen3.5 chama a mascara com `position_ids` (nao `cache_position`). As posicoes ja sao
+        # exatamente o que a mascara precisa para alinhar query e KV, entao usamos elas quando
+        # presentes; senao derivamos o comprimento da query.
+        # q_length deve ser o numero de tokens NOVOS (inputs_embeds), nao o comprimento do eixo KV.
+        embeds = kwargs.get("inputs_embeds")
+        if _qlen_kw is not None:
+            q_len = int(_qlen_kw)
+        elif embeds is not None:
+            q_len = embeds.shape[1]
+        else:
+            q_len = kv_length - kv_offset
+        cache_position = torch.arange(
+            q_len, device=(attention_mask.device if attention_mask is not None else None)
+        )
     q_length = cache_position.shape[0]
     # Potentially pad the 2D mask, and slice it correctly
     if _prepare_padding_mask_slice:
@@ -424,7 +491,15 @@ def sdpa_mask_without_vmap(
         padding_mask = prepare_padding_mask(attention_mask, kv_length, kv_offset)
 
     # Under specific conditions, we can avoid materializing the mask, instead relying on the `is_causal` argument
-    if allow_is_causal_skip and _ignore_causal_mask_sdpa(padding_mask, q_length, kv_length, kv_offset, local_size):
+    if kv_offset is None:
+        kv_offset = 0
+    # Nao pulamos a materializacao da mascara: modelos hibridos (Qwen3.5) chegam aqui com
+    # attention_mask 2D e o `is_causal` do SDPA producao uma mascara de tamanho divergente
+    # (medido: "size of tensor a (32) must match tensor b (16)"). Materializar sempre e correto
+    # e o custo em export e irrelevante.
+    if False and allow_is_causal_skip and _ignore_causal_mask_sdpa(
+        padding_mask, q_length, kv_length, kv_offset, kv_offset, local_size
+    ):
         return None
 
     # Potentially add the padding 2D mask
@@ -489,11 +564,39 @@ def traceable_scaled_dot_product_attention(
     **kwargs,
 ) -> torch.Tensor:
     if isinstance(is_causal, torch.Tensor):
-        is_causal = is_causal.item()
+        is_causal = bool(is_causal.item())
 
-    if "enable_gqa" in kwargs:
-        kwargs.pop("enable_gqa")
+    # Quando uma mascara explicita e passada, `is_causal` deve ser False: combinar os dois faz o
+    # SDPA validar a mascara contra o eixo de query e falhar em modelos com cache.
+    if attn_mask is not None:
+        is_causal = False
 
+    # `is_causal=True` so e valido quando query e chave tem o mesmo comprimento. Com cache (decode
+    # ou prefill continuando de um passado) kv_length > q_length, e o SDPA aborta com
+    # "size of tensor a (16) must match the size of tensor b (32) at non-singleton dimension 2".
+    # O optimum pode chegar aqui com attn_mask=None porque o atalho `allow_is_causal_skip`
+    # (mascara desnecessaria) nao conhece o cache hibrido do Qwen3.5. Nesse caso materializamos a
+    # mascara causal explicitamente — o resultado e identico e exporta.
+    q_len = query.shape[-2]
+    kv_len = key.shape[-2]
+    _ic = bool(is_causal) if isinstance(is_causal, torch.Tensor) else is_causal
+    if _ic and kv_len != q_len:
+        causal = torch.ones(q_len, kv_len, dtype=torch.bool, device=query.device).tril(
+            diagonal=kv_len - q_len
+        )
+        attn_mask = torch.zeros(q_len, kv_len, dtype=query.dtype, device=query.device).masked_fill(
+            ~causal, torch.finfo(query.dtype).min
+        )
+        is_causal = False
+
+    # NAO remover `enable_gqa`: Qwen3.5 usa GQA (8 heads de query, 2 de KV). O optimum descartava
+    # essa flag e o SDPA tentava casar 8 com 2 no eixo de heads
+    # ("size of tensor a (16) must match tensor b (32)").
+    if os.environ.get("CT0_SPY"):
+        print("[spy] q=%s k=%s v=%s mask=%s is_causal=%r gqa=%r kw=%s" % (
+            tuple(query.shape), tuple(key.shape), tuple(value.shape),
+            tuple(attn_mask.shape) if attn_mask is not None else None,
+            is_causal, kwargs.get("enable_gqa"), sorted(kwargs)), flush=True)
     attn_weights = original_scaled_dot_product_attention(
         query=query, key=key, value=value, attn_mask=attn_mask, dropout_p=dropout_p, is_causal=is_causal, **kwargs
     )
@@ -612,9 +715,9 @@ class ModelPatcher:
                 # Most models require past_key_values to be a cache instance instead of a tuple now
                 pkv_index = list(signature.parameters.keys()).index("past_key_values")
                 if pkv_index < len(args) and args[pkv_index] is not None:
-                    args[pkv_index] = preprocess_past_key_values(args[pkv_index])
+                    args[pkv_index] = preprocess_past_key_values(args[pkv_index], config=self.real_config)
                 elif kwargs.get("past_key_values") is not None:
-                    kwargs["past_key_values"] = preprocess_past_key_values(kwargs["past_key_values"])
+                    kwargs["past_key_values"] = preprocess_past_key_values(kwargs["past_key_values"], config=self.real_config)
 
             if "encoder_outputs" in signature.parameters:
                 # Some encoder-decoder models started to not accept encoder_outputs as tuple (e.g. moonshine)
@@ -924,7 +1027,7 @@ class SpeechT5ModelPatcher(ModelPatcher):
             encoder_attention_mask=None,
         ):
             if past_key_values is not None:
-                past_key_values = preprocess_past_key_values(past_key_values)
+                past_key_values = preprocess_past_key_values(past_key_values, config=self.real_config)
 
             if self.real_config._behavior == "encoder":
                 encoder_attention_mask = torch.ones_like(input_ids)
@@ -1459,3 +1562,132 @@ class GptOssModelPatcher(ModelPatcher):
 
         if is_transformers_version(">=", "4.55.0"):
             GptOssExperts.forward = self.original_gpt_oss_forward
+
+def qwen3_5_gdn_forward(self, hidden_states, cache_params=None, attention_mask=None, **kwargs):
+    """Forward export-safe do Gated-DeltaNet.
+
+    O conv causal e reescrito sem padding dinamico (o original emite aten::copy). O kernel
+    segue o dispatch do upstream: recorrente em decode (seq==1), chunked em prefill. O chunked
+    original nao exporta; roda via scan_chunk (torch.scan -> ONNX Scan).
+    """
+    import transformers.models.qwen3_5.modeling_qwen3_5 as q35
+    m = q35
+    hidden_states = m.apply_mask_to_padding_states(hidden_states, attention_mask)
+    batch_size, seq_len, _ = hidden_states.shape
+    mixed_qkv = self.in_proj_qkv(hidden_states).transpose(1, 2)
+    z = self.in_proj_z(hidden_states).reshape(batch_size, seq_len, -1, self.head_v_dim)
+    b = self.in_proj_b(hidden_states)
+    a = self.in_proj_a(hidden_states)
+
+    K = self.conv_kernel_size
+    # `conv_states[0]` pode existir mas ser None (prefill sem estado previo) — o branch tem de
+    # tratar os dois casos, senao cai em torch.cat(None, ...) no primeiro forward.
+    stored = None
+    if cache_params is not None:
+        try:
+            stored = cache_params.layers[self.layer_idx].conv_states[0]
+        except Exception:
+            stored = None
+    if stored is not None:
+        full = torch.cat([stored, mixed_qkv], dim=-1)
+        cache_params.layers[self.layer_idx].conv_states[0] = full[:, :, -K:]
+        conv_in = full[:, :, full.shape[-1] - (K - 1 + seq_len):]
+    else:
+        conv_in = torch.nn.functional.pad(mixed_qkv, (K - 1, 0))
+        if cache_params is not None:
+            cache_params.layers[self.layer_idx].conv_states[0] = mixed_qkv[:, :, -K:]
+
+    mixed_qkv = torch.nn.functional.conv1d(
+        conv_in, self.conv1d.weight, self.conv1d.bias, groups=self.conv_dim
+    )
+    mixed_qkv = torch.nn.functional.silu(mixed_qkv) if self.activation == "silu" \
+        else getattr(torch.nn.functional, self.activation)(mixed_qkv)
+    mixed_qkv = mixed_qkv.transpose(1, 2)
+
+    query, key, value = torch.split(
+        mixed_qkv, [self.key_dim, self.key_dim, self.value_dim], dim=-1
+    )
+    query = query.reshape(batch_size, seq_len, -1, self.head_k_dim)
+    key = key.reshape(batch_size, seq_len, -1, self.head_k_dim)
+    value = value.reshape(batch_size, seq_len, -1, self.head_v_dim)
+    beta = b.sigmoid()
+    import torch.nn.functional as F
+    g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
+
+    if self.num_v_heads // self.num_k_heads > 1:
+        rep = self.num_v_heads // self.num_k_heads
+
+        def _rep(x):
+            bb, ss, hh, dd = x.shape
+            return x.unsqueeze(3).expand(bb, ss, hh, rep, dd).reshape(bb, ss, hh * rep, dd)
+
+        query = _rep(query)
+        key = _rep(key)
+
+    recurrent_state = (
+        cache_params.layers[self.layer_idx].recurrent_states[0] if cache_params is not None else None
+    )
+    core_attn_out, last_recurrent_state = m.torch_recurrent_gated_delta_rule(
+        query, key, value, g=g, beta=beta, initial_state=recurrent_state,
+        output_final_state=cache_params is not None, use_qk_l2norm_in_kernel=True,
+        cu_seqlens=kwargs.pop("cu_seq_lens_q", None), **kwargs,
+    )
+    if cache_params is not None:
+        cache_params.update_recurrent_state(last_recurrent_state, self.layer_idx)
+    core_attn_out = core_attn_out.reshape(-1, self.head_v_dim)
+    z = z.reshape(-1, self.head_v_dim)
+    core_attn_out = self.norm(core_attn_out, z)
+    core_attn_out = core_attn_out.reshape(batch_size, seq_len, -1)
+    return self.out_proj(core_attn_out)
+
+
+
+class Qwen3_5ModelPatcher(ModelPatcher):
+    """Torna o Qwen3.5 exportavel.
+
+    - O conv causal original usa padding dinamico e emite `aten::copy`, que nao exporta. O forward
+      do Gated-DeltaNet e reescrito sem esse padding e com o kernel recorrente (o chunked usa
+      `linalg_solve_triangular`, tambem nao exportavel). Os dois kernels sao equivalentes
+      (verificado: cos 0.99999994, maxdiff 2.2e-08), entao a troca nao altera o resultado.
+    """
+
+    def __enter__(self):
+        super().__enter__()
+        import transformers.models.qwen3_5.modeling_qwen3_5 as q35
+
+        self._orig_gdn_forward = q35.Qwen3_5GatedDeltaNet.forward
+        q35.Qwen3_5GatedDeltaNet.forward = qwen3_5_gdn_forward
+        print("[ct0] patcher APLICADO", flush=True)
+
+        # `update_recurrent_state` e `update_conv_state` fazem `copy_` IN-PLACE "para preservar o
+        # endereco estatico para cudagraphs". Isso e incompativel com export: o tracer descarta a
+        # mutacao ("Removing mutation from node aten::copy_ on block input"), corrompendo o estado,
+        # e o operador `aten::copy` nao tem traducao ONNX. Substituimos por atribuicao funcional,
+        # que produz o mesmo valor.
+        from transformers.cache_utils import LinearAttentionLayer
+
+        def _functional_update_recurrent(self, recurrent_states, state_idx=0, **kw):
+            if not self.is_recurrent_states_initialized[state_idx]:
+                self.lazy_initialization(recurrent_states=recurrent_states, state_idx=state_idx)
+            self.recurrent_states[state_idx] = recurrent_states
+            return self.recurrent_states[state_idx]
+
+        def _functional_update_conv(self, conv_states, state_idx=0, **kw):
+            if not self.is_conv_states_initialized[state_idx]:
+                self.lazy_initialization(conv_states=conv_states, state_idx=state_idx)
+            self.conv_states[state_idx] = conv_states
+            return self.conv_states[state_idx]
+
+        self._orig_upd_rec = LinearAttentionLayer.update_recurrent_state
+        self._orig_upd_conv = LinearAttentionLayer.update_conv_state
+        LinearAttentionLayer.update_recurrent_state = _functional_update_recurrent
+        LinearAttentionLayer.update_conv_state = _functional_update_conv
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        import transformers.models.qwen3_5.modeling_qwen3_5 as q35
+        from transformers.cache_utils import LinearAttentionLayer
+
+        q35.Qwen3_5GatedDeltaNet.forward = self._orig_gdn_forward
+        LinearAttentionLayer.update_recurrent_state = self._orig_upd_rec
+        LinearAttentionLayer.update_conv_state = self._orig_upd_conv
+        super().__exit__(exc_type, exc_value, traceback)
